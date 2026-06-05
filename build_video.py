@@ -41,8 +41,24 @@ def create_silent_audio(filepath, duration=3):
         "-t", str(duration), "-acodec", "pcm_s16le", filepath
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def clean_text_for_prosody(text):
+    """
+    Sanitizes text without breaking it into tiny pieces.
+    Replaces problem characters with engine-safe equivalents that preserve human flow.
+    """
+    if not text: 
+        return ""
+    
+    # Replace question marks with an ellipsis (...) 
+    # This tricks LLM-based TTS engines into making a natural, curious pause 
+    # instead of hitting the "end-of-generation" token crash.
+    sanitized = text.replace("?", "...").replace("!", ".")
+    
+    # Keep commas! They give the engine structural cues for natural breathing pauses.
+    return sanitized.strip()
+
 def generate_audio_for_slides(notes_dict, total_slides):
-    print("[DEBUG] Generating audio assets from TTS server...")
+    print("[DEBUG] Generating high-prosody audio assets from TTS server...")
     for slide_num in range(1, total_slides + 1):
         final_audio_filename = f"audio_{slide_num}.wav"
         final_audio_path = os.path.join(BUILD_DIR, final_audio_filename)
@@ -50,37 +66,23 @@ def generate_audio_for_slides(notes_dict, total_slides):
         note = notes_dict.get(slide_num, "")
         
         if note:
-            chunks = clean_and_chunk_text(note)
-            part_files = []
-            success = True
+            # Clean the text but keep it as ONE single, natural paragraph
+            safe_paragraph = clean_text_for_prosody(note)
+            print(f"[DEBUG] Slide {slide_num} Full Prompt: \"{safe_paragraph}\"")
             
-            for j, chunk in enumerate(chunks):
-                part_filename = f"audio_{slide_num}_part_{j}.wav"
-                part_path = os.path.join(BUILD_DIR, part_filename)
-                
-                payload = {"prompt": chunk, "description": TTS_DESC}
-                try:
-                    response = requests.post(TTS_URL, json=payload, timeout=30)
-                    response.raise_for_status()
-                    with open(part_path, 'wb') as f:
-                        f.write(response.content)
-                    part_files.append(part_filename)
-                except Exception as e:
-                    print(f"  [ERROR] TTS failed on slide {slide_num}, chunk {j}: {e}")
-                    success = False
-                    break
-            
-            if success and part_files:
-                concat_list_filename = f"concat_audio_{slide_num}.txt"
-                with open(os.path.join(BUILD_DIR, concat_list_filename), "w") as f:
-                    for part in part_files:
-                        f.write(f"file '{part}'\n")
-                
-                subprocess.run([
-                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", 
-                    "-i", concat_list_filename, "-c", "copy", final_audio_filename
-                ], cwd=BUILD_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
+            payload = {
+                "prompt": safe_paragraph, 
+                "description": TTS_DESC
+            }
+            try:
+                # Send the entire note in a single API call so the model inflects naturally
+                response = requests.post(TTS_URL, json=payload, timeout=45)
+                response.raise_for_status()
+                with open(final_audio_path, 'wb') as f:
+                    f.write(response.content)
+                print(f"  ✓ Generated natural audio for slide {slide_num}")
+            except Exception as e:
+                print(f"  [ERROR] TTS failed on slide {slide_num}: {e}")
                 create_silent_audio(final_audio_path, duration=3)
         else:
             create_silent_audio(final_audio_path, duration=3)

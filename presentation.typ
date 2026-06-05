@@ -5,7 +5,7 @@
 = Introduction to Automation
 *Generate videos from code*
 
-/* NOTE 1: Hello everyone and welcome to this presentation. Today we are going to learn how to completely automate video creation using Typst a local text to speech server and FFmpeg. */
+/* NOTE 1: Hello everyone and welcome to this presentation. Today we are going to learn how to completely automate video creation using Typst, a local text to speech server, and FFmpeg. */
 
 #pagebreak()
 
@@ -14,7 +14,7 @@
 - *Speed:* Update the text, run the script, get a new video.
 - *Version Control:* Manage your presentations on Git.
 
-/* NOTE 2: You might wonder why automate this. Automation provides consistency incredible speed when updating content and allows you to keep your entire video in a version control system. */
+/* NOTE 2: You might wonder why automate this. Automation provides consistency, incredible speed when updating content, and allows you to keep your entire video in a version control system. */
 
 #pagebreak()
 
