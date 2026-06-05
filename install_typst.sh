@@ -1,13 +1,15 @@
 #!/bin/bash
 
-# Exit immediately if any command fails
+# Exit immediately if any command fails (prevents cascading errors)
 set -e
 
 # Define version and filenames
 VERSION="v0.14.2"
 ARCHIVE="typst-x86_64-unknown-linux-musl.tar.xz"
 DIR_NAME="typst-x86_64-unknown-linux-musl"
-URL="https://github.com{VERSION}/${ARCHIVE}"
+
+# CORRECTED: Pointing to the actual official GitHub release asset location
+URL="https://github.com/typst/typst/releases/download/${VERSION}/${ARCHIVE}"
 
 echo "Starting Typst ${VERSION} installation..."
 

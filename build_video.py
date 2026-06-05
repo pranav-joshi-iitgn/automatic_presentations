@@ -1,21 +1,40 @@
 import os
 import re
-import requests
 import subprocess
 import shutil
+import warnings
+import io
+import sys
+from contextlib import redirect_stdout, redirect_stderr
+
+# --- Suppress ALL Standard ML Warning Junk ---
+warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+import torch
+import gc
+import soundfile as sf
+from parler_tts import ParlerTTSForConditionalGeneration
+from transformers import AutoTokenizer, logging
+
+logging.set_verbosity_error()
 
 # --- Configuration ---
 TYPST_FILE = "presentation.typ"
 BUILD_DIR = "build"
+SEGMENTS_DIR = os.path.join(BUILD_DIR, "segments")
 FINAL_OUTPUT = "final_presentation.mp4"
-TTS_URL = "http://10.0.60.193:8000/generate"
 TTS_DESC = "Divya's voice is monotone yet slightly fast in delivery, with a very close recording that almost has no background noise."
 
+# Environment tweak to handle fragmented VRAM spaces alongside Ollama
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 def cleanup():
-    print(f"[DEBUG] Wiping and creating clean build directory: '{BUILD_DIR}'")
+    print(f"[DEBUG] Wiping and creating clean build directories...")
     if os.path.exists(BUILD_DIR):
         shutil.rmtree(BUILD_DIR)
     os.makedirs(BUILD_DIR)
+    os.makedirs(SEGMENTS_DIR)
 
 def extract_numbered_notes(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -25,11 +44,11 @@ def extract_numbered_notes(filepath):
     print(f"[DEBUG] Found {len(notes_dict)} numbered notes.")
     return notes_dict
 
-def clean_and_chunk_text(text):
-    if not text: return []
-    sanitized = text.replace("?", ".").replace("!", ".").replace(",", "")
-    chunks = [c.strip() for c in re.split(r'\s*\.\s*', sanitized) if c.strip()]
-    return chunks
+def clean_text_for_prosody(text):
+    if not text: 
+        return ""
+    sanitized = text.replace("?", "...").replace("!", ".")
+    return sanitized.strip()
 
 def generate_slide_images():
     print("[DEBUG] Compiling presentation slides via Typst...")
@@ -41,24 +60,27 @@ def create_silent_audio(filepath, duration=3):
         "-t", str(duration), "-acodec", "pcm_s16le", filepath
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def clean_text_for_prosody(text):
-    """
-    Sanitizes text without breaking it into tiny pieces.
-    Replaces problem characters with engine-safe equivalents that preserve human flow.
-    """
-    if not text: 
-        return ""
-    
-    # Replace question marks with an ellipsis (...) 
-    # This tricks LLM-based TTS engines into making a natural, curious pause 
-    # instead of hitting the "end-of-generation" token crash.
-    sanitized = text.replace("?", "...").replace("!", ".")
-    
-    # Keep commas! They give the engine structural cues for natural breathing pauses.
-    return sanitized.strip()
-
 def generate_audio_for_slides(notes_dict, total_slides):
-    print("[DEBUG] Generating high-prosody audio assets from TTS server...")
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"\n🤖 Loading Indic Parler-TTS locally onto device: {device}...")
+    
+    try:
+        # CHANGED: Forcefully trap and silence Parler's hardcoded config prints
+        trap = io.StringIO()
+        with redirect_stdout(trap), redirect_stderr(trap):
+            model = ParlerTTSForConditionalGeneration.from_pretrained(
+                "ai4bharat/indic-parler-tts", 
+                torch_dtype=torch.float16
+            ).to(device)
+            model.eval()
+            
+            tokenizer = AutoTokenizer.from_pretrained("ai4bharat/indic-parler-tts")
+            description_tokenizer = AutoTokenizer.from_pretrained(model.config.text_encoder._name_or_path)
+    except Exception as e:
+        print(f"❌ [CRITICAL ERROR] Failed to load local weights: {e}")
+        return
+
+    print("[DEBUG] Generating high-prosody audio assets locally...")
     for slide_num in range(1, total_slides + 1):
         final_audio_filename = f"audio_{slide_num}.wav"
         final_audio_path = os.path.join(BUILD_DIR, final_audio_filename)
@@ -66,29 +88,47 @@ def generate_audio_for_slides(notes_dict, total_slides):
         note = notes_dict.get(slide_num, "")
         
         if note:
-            # Clean the text but keep it as ONE single, natural paragraph
             safe_paragraph = clean_text_for_prosody(note)
             print(f"[DEBUG] Slide {slide_num} Full Prompt: \"{safe_paragraph}\"")
             
-            payload = {
-                "prompt": safe_paragraph, 
-                "description": TTS_DESC
-            }
             try:
-                # Send the entire note in a single API call so the model inflects naturally
-                response = requests.post(TTS_URL, json=payload, timeout=45)
-                response.raise_for_status()
-                with open(final_audio_path, 'wb') as f:
-                    f.write(response.content)
-                print(f"  ✓ Generated natural audio for slide {slide_num}")
+                with torch.no_grad():
+                    desc_inputs = description_tokenizer(TTS_DESC, return_tensors="pt").to(device)
+                    prompt_inputs = tokenizer(safe_paragraph, return_tensors="pt").to(device)
+
+                    generation = model.generate(
+                        input_ids=desc_inputs.input_ids,
+                        attention_mask=desc_inputs.attention_mask,
+                        prompt_input_ids=prompt_inputs.input_ids,
+                        prompt_attention_mask=prompt_inputs.attention_mask
+                    )
+                    
+                    # CHANGED: Cast the 16-bit tensor back to 32-bit so soundfile can save it cleanly
+                    audio_arr = generation.cpu().numpy().squeeze().astype("float32")
+                    sf.write(final_audio_path, audio_arr, model.config.sampling_rate)
+                    print(f"  ✓ Generated natural audio for slide {slide_num}")
+                
             except Exception as e:
-                print(f"  [ERROR] TTS failed on slide {slide_num}: {e}")
+                print(f"  [ERROR] Local inference engine failed on slide {slide_num}: {e}")
                 create_silent_audio(final_audio_path, duration=3)
+            finally:
+                if 'desc_inputs' in locals(): del desc_inputs
+                if 'prompt_inputs' in locals(): del prompt_inputs
+                if 'generation' in locals(): del generation
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
+            print(f"  - No note for slide {slide_num}. Generating default silence.")
             create_silent_audio(final_audio_path, duration=3)
+            
+    print("\n🧹 Batch complete. Cleaning up master model layers...")
+    del model, tokenizer, description_tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def get_audio_duration(filepath):
-    """Uses ffprobe to capture the precise float duration of an audio track."""
     cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", filepath
@@ -96,49 +136,52 @@ def get_audio_duration(filepath):
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return float(result.stdout.strip())
 
-def stitch_video_single_pass(total_slides):
-    print("\n🎬 Commencing Single-Pass Video Assembly via Filter Complex...")
+def build_segments_and_stitch_gpu(total_slides):
+    print("\n🎬 Commencing GPU-Accelerated Video Assembly...")
     
-    cmd = ["ffmpeg", "-y"]
-    filter_inputs = ""
+    concat_list_path = os.path.join(BUILD_DIR, "concat.txt")
     
-    for i in range(1, total_slides + 1):
-        img_path = os.path.join(BUILD_DIR, f"slide_{i}.png")
-        audio_path = os.path.join(BUILD_DIR, f"audio_{i}.wav")
-        
-        # Get the strict duration of this slide's audio
-        duration = get_audio_duration(audio_path)
-        print(f"  -> Slide {i}: Audio length is exactly {duration:.3f} seconds.")
-        
-        # Lock the video stream generation of this image to the exact audio duration
-        cmd.extend(["-loop", "1", "-t", str(duration), "-i", img_path])
-        cmd.extend(["-i", audio_path])
-        
-        # Calculate indices for the filter complex string
-        img_idx = 2 * (i - 1)
-        aud_idx = img_idx + 1
-        filter_inputs += f"[{img_idx}:v][{aud_idx}:a]"
-        
-    # Build the linear concat instruction sequence
-    filter_complex_str = f"{filter_inputs} concat=n={total_slides}:v=1:a=1 [v][a]"
-    
-    cmd.extend([
-        "-filter_complex", filter_complex_str,
-        "-map", "[v]",
-        "-map", "[a]",
-        "-c:v", "libx264",
-        "-r", "24",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        FINAL_OUTPUT
-    ])
-    
-    print("[DEBUG] Running master FFmpeg compilation pipeline...")
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    with open(concat_list_path, "w") as concat_file:
+        for i in range(1, total_slides + 1):
+            img_path = os.path.join(BUILD_DIR, f"slide_{i}.png")
+            audio_path = os.path.join(BUILD_DIR, f"audio_{i}.wav")
+            segment_filename = f"segment_{i}.mp4"
+            segment_path = os.path.join(SEGMENTS_DIR, segment_filename)
+            
+            duration = get_audio_duration(audio_path)
+            print(f"  -> Slide {i}: Compiling {duration:.3f}s segment via NVENC...")
+            
+            cmd = [
+                "ffmpeg", "-y", 
+                "-loop", "1", "-framerate", "24", 
+                "-i", img_path, 
+                "-i", audio_path, 
+                "-t", str(duration), 
+                "-c:v", "h264_nvenc", "-preset", "slow", 
+                "-pix_fmt", "yuv420p", 
+                "-c:a", "aac", "-b:a", "192k", 
+                segment_path
+            ]
+            
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                print(f"  [ERROR] GPU encoding failed for segment {i}:\n{res.stderr}")
+                exit(1)
+                
+            concat_file.write(f"file 'segments/{segment_filename}'\n")
+
+    print("\n[DEBUG] Assembling master timeline video file from generated segments...")
+    res = subprocess.run([
+        "ffmpeg", "-y", 
+        "-f", "concat", "-safe", "0", 
+        "-i", "concat.txt", 
+        "-c", "copy", 
+        os.path.abspath(FINAL_OUTPUT)
+    ], cwd=BUILD_DIR, capture_output=True, text=True)
     
     if res.returncode == 0:
-        print(f"\n✅ SUCCESS! The master video timeline is synchronized: {FINAL_OUTPUT}")
+        print(f"✅ SUCCESS! Final presentation saved to: {FINAL_OUTPUT}")
+        print(f"📁 Individual slides preserved in: {SEGMENTS_DIR}/")
     else:
         print(f"\n[ERROR] Master layout engine failed:\n{res.stderr}")
 
@@ -152,4 +195,4 @@ if __name__ == "__main__":
     notes_dict = extract_numbered_notes(TYPST_FILE)
     generate_audio_for_slides(notes_dict, total_slides)
     
-    stitch_video_single_pass(total_slides)
+    build_segments_and_stitch_gpu(total_slides)
